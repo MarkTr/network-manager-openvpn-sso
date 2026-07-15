@@ -172,7 +172,9 @@ impl VpnPlugin {
     ) -> zbus::fdo::Result<String> {
         info!("NeedSecrets called");
 
-        // Log all received data for debugging
+        // Log all received data for debugging. The "secrets" key (in the "vpn"
+        // section) holds real credentials — never print its value, only that
+        // it was present, to avoid leaking cleartext passwords to the journal.
         for (section, data) in &connection {
             info!(
                 "  Section '{}' keys: {:?}",
@@ -180,7 +182,11 @@ impl VpnPlugin {
                 data.keys().collect::<Vec<_>>()
             );
             for (key, val) in data {
-                info!("    {}: {:?}", key, val);
+                if key == "secrets" {
+                    info!("    {}: <redacted>", key);
+                } else {
+                    info!("    {}: {:?}", key, val);
+                }
             }
         }
 

@@ -275,6 +275,9 @@ fn get_string_dict(
 
     dict.get(key).and_then(|v| {
         let mut result = HashMap::new();
+        // The "secrets" dict holds real credentials — never log its contents,
+        // only that parsing happened, to avoid leaking cleartext passwords.
+        let is_secret = key == "secrets";
 
         // Log the raw value for debugging
         info!(
@@ -285,7 +288,11 @@ fn get_string_dict(
 
         // Try to access as Dict<String, String> using Value
         let value: Value = v.clone().into();
-        info!("Converted to Value variant: {:?}", value);
+        if is_secret {
+            info!("Converted to Value variant: <redacted>");
+        } else {
+            info!("Converted to Value variant: {:?}", value);
+        }
 
         // Try as Dict
         if let Value::Dict(dict_val) = &value {
@@ -300,7 +307,11 @@ fn get_string_dict(
         // Fallback: try parsing from string representation
         if result.is_empty() {
             let s = v.to_string();
-            info!("Trying string parse from: {}", s);
+            if is_secret {
+                info!("Trying string parse from: <redacted>");
+            } else {
+                info!("Trying string parse from: {}", s);
+            }
 
             // Format from NetworkManager is often "key = value, key2 = value2"
             // when converted to string
@@ -315,7 +326,15 @@ fn get_string_dict(
             }
         }
 
-        info!("Parsed vpn.data result: {:?}", result);
+        if is_secret {
+            info!(
+                "Parsed vpn.{} result: <redacted, {} keys>",
+                key,
+                result.len()
+            );
+        } else {
+            info!("Parsed vpn.{} result: {:?}", key, result);
+        }
 
         if result.is_empty() {
             None
