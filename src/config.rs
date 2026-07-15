@@ -168,6 +168,15 @@ impl ConnectionConfig {
                 "--persist-tun".to_string(),
                 "--resolv-retry".to_string(),
                 "infinite".to_string(),
+                // Every connection this plugin drives expects a live username/password
+                // prompt over the management interface (--management-query-passwords,
+                // below) — whether that's the SSO placeholder or a real hybrid-auth
+                // password. Without this, and with no --cert/--key/--pkcs12 configured,
+                // OpenVPN refuses to start at all: "No client-side authentication
+                // method is specified." Raw .ovpn files (--config mode) typically
+                // already declare this themselves; NM-imported individual-field
+                // connections don't unless we add it here.
+                "--auth-user-pass".to_string(),
             ]);
 
             if let Some(ref ca) = self.ca {
@@ -490,6 +499,19 @@ mod tests {
             connection_type: None,
             requires_password: false,
         }
+    }
+
+    #[test]
+    fn build_openvpn_args_nm_imported_mode_includes_auth_user_pass() {
+        let mut config = base_config();
+        config.config_path = None;
+        config.ca = Some("/etc/openvpn/ca.pem".to_string());
+        let args = config.build_openvpn_args("/tmp/sock");
+        assert!(
+            args.iter().any(|a| a == "--auth-user-pass"),
+            "NM-imported connections need --auth-user-pass or OpenVPN refuses to start \
+             with no --cert/--key/--pkcs12 configured either"
+        );
     }
 
     #[test]

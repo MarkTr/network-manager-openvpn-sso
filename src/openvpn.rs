@@ -165,20 +165,34 @@ impl OpenVpnManager {
             // Check if OpenVPN has already exited (e.g., config error)
             if let Some(ref mut child) = self.process {
                 if let Ok(Some(status)) = child.try_wait() {
+                    use tokio::io::AsyncReadExt;
+
+                    // OpenVPN writes its startup/fatal-option/cert-load errors to
+                    // stdout by default (no --log/--syslog configured), not
+                    // stderr — read both or the real error is silently lost.
+                    let mut stdout_msg = String::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        let mut buf = Vec::new();
+                        let _ = stdout.read_to_end(&mut buf).await;
+                        stdout_msg = String::from_utf8_lossy(&buf).to_string();
+                    }
                     let mut stderr_msg = String::new();
                     if let Some(mut stderr) = child.stderr.take() {
-                        use tokio::io::AsyncReadExt;
                         let mut buf = Vec::new();
                         let _ = stderr.read_to_end(&mut buf).await;
                         stderr_msg = String::from_utf8_lossy(&buf).to_string();
                     }
                     error!("OpenVPN exited early with status: {}", status);
+                    if !stdout_msg.is_empty() {
+                        error!("OpenVPN stdout: {}", stdout_msg);
+                    }
                     if !stderr_msg.is_empty() {
                         error!("OpenVPN stderr: {}", stderr_msg);
                     }
                     return Err(anyhow!(
-                        "OpenVPN exited with status {} before creating management socket. stderr: {}",
+                        "OpenVPN exited with status {} before creating management socket. stdout: {} stderr: {}",
                         status,
+                        stdout_msg,
                         stderr_msg
                     ));
                 }
