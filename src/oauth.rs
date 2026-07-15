@@ -305,23 +305,52 @@ fn try_open_browser(url: &str) -> bool {
             }
         };
 
+        let xdg_runtime = format!("/run/user/{}", uid);
+
+        // Get user's environment from their processes
+        let user_env = get_user_graphical_env(&user, uid);
+        info!("User graphical env: {:?}", user_env);
+
         // Method 1 (preferred): Use systemd-run --user to run in the user's session scope.
-        // This inherits the user's full environment (DISPLAY, WAYLAND_DISPLAY, DBUS, etc.)
-        // and properly communicates with existing browser instances.
+        //
+        // systemd-run --user only gives the transient unit whatever's already in the
+        // user's systemd --user manager's own environment — which does not reliably
+        // include WAYLAND_DISPLAY/DISPLAY/DBUS_SESSION_BUS_ADDRESS unless the desktop
+        // session explicitly imported them. Explicitly pass the same env vars Method 2
+        // discovers via /proc/<pid>/environ, via --setenv, so this has the same chance
+        // of working as the runuser fallback below.
+        //
+        // --no-block previously made systemd-run return as soon as the job was *queued*,
+        // not once xdg-open actually ran — its exit status only reflected "systemd
+        // accepted the job", not "the browser opened". That made this method silently
+        // "succeed" even when xdg-open failed inside the user's session, masking the
+        // real failure and preventing the working fallback methods below from ever
+        // being tried. Use --wait instead so the exit status is xdg-open's own, bounded
+        // by an outer `timeout` in case a browser wrapper never detaches.
+        //
+        // xdg-open on GNOME resolves to `gio open`, which just fires an async D-Bus
+        // request and returns immediately — the actual browser window appears slightly
+        // *after* xdg-open exits. With --collect, systemd-run tears down the transient
+        // unit's cgroup the instant its direct child exits, which can kill that in-flight
+        // activation before the window appears. Sleep briefly after xdg-open returns so
+        // the unit survives long enough for the async launch to actually complete
+        // (confirmed empirically: adding a delay after xdg-open is what made this work).
         {
-            let mut cmd = std::process::Command::new("systemd-run");
-            cmd.args([
+            let mut cmd = std::process::Command::new("timeout");
+            cmd.arg("12").arg("systemd-run").args([
                 "--user",
                 &format!("--machine={}@", user),
                 "--collect",
-                "--no-block",
+                "--wait",
                 "--quiet",
-                "xdg-open",
-                url,
             ]);
+            for (key, value) in &user_env {
+                cmd.arg(format!("--setenv={}={}", key, value));
+            }
+            cmd.args(["--", "sh", "-c", "xdg-open \"$1\"; sleep 2", "sh", url]);
 
             info!(
-                "Running: systemd-run --user --machine={}@ xdg-open {}",
+                "Running: timeout 12 systemd-run --user --machine={}@ --wait xdg-open {} (+2s grace period)",
                 user, url
             );
             match cmd.output() {
@@ -342,12 +371,6 @@ fn try_open_browser(url: &str) -> bool {
                 }
             }
         }
-
-        let xdg_runtime = format!("/run/user/{}", uid);
-
-        // Get user's environment from their processes
-        let user_env = get_user_graphical_env(&user, uid);
-        info!("User graphical env: {:?}", user_env);
 
         // Method 2: Try xdg-open with user's environment via runuser
         {
