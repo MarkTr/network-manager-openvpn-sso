@@ -190,11 +190,25 @@ impl ConnectionConfig {
 
         // Common: apply overrides
         if let Some(ref remote) = self.remote {
-            // NM stores remote as "host:port" — split for OpenVPN's --remote host [port]
-            if let Some((host, port)) = remote.rsplit_once(':') {
-                args.extend(["--remote".to_string(), host.to_string(), port.to_string()]);
-            } else {
-                args.extend(["--remote".to_string(), remote.clone()]);
+            // NM stores remotes as comma-separated "host:port:proto" or "host:port" entries.
+            // Each entry becomes a separate --remote host port [proto] argument.
+            for entry in remote.split(',') {
+                let parts: Vec<&str> = entry.trim().split(':').collect();
+                match parts.as_slice() {
+                    [host, port, proto] => args.extend([
+                        "--remote".to_string(),
+                        host.to_string(),
+                        port.to_string(),
+                        proto.to_string(),
+                    ]),
+                    [host, port] => args.extend([
+                        "--remote".to_string(),
+                        host.to_string(),
+                        port.to_string(),
+                    ]),
+                    [host] => args.extend(["--remote".to_string(), host.to_string()]),
+                    _ => {}
+                }
             }
         }
 
