@@ -32,6 +32,7 @@ NM_PLUGIN_DIR="$LIBDIR"
 DBUS_SYSTEM_CONF="$PREFIX/share/dbus-1/system.d"
 DESKTOP_DIR="$PREFIX/share/applications"
 BIN_DIR="$PREFIX/bin"
+LIBEXEC_DIR="${LIBEXECDIR:-$PREFIX/libexec}"
 
 # Build the project
 info "Building nm-openvpn-sso..."
@@ -53,10 +54,22 @@ mkdir -p "$NM_PLUGIN_DIR"
 mkdir -p "$DBUS_SYSTEM_CONF"
 mkdir -p "$DESKTOP_DIR"
 mkdir -p "$BIN_DIR"
+mkdir -p "$LIBEXEC_DIR"
 
 # Install binary
 info "Installing binary to $NM_PLUGIN_DIR..."
 install -m 755 "$BINARY" "$NM_PLUGIN_DIR/nm-openvpn-sso-service"
+
+# Install GNOME auth-dialog helper (prompts for username/password on
+# "requires-password" connections; GNOME Shell execs this directly, no
+# nm-applet required)
+AUTH_DIALOG="target/release/nm-openvpn-sso-auth-dialog"
+if [[ -f "$AUTH_DIALOG" ]]; then
+    info "Installing GNOME auth-dialog helper to $LIBEXEC_DIR..."
+    install -m 755 "$AUTH_DIALOG" "$LIBEXEC_DIR/nm-openvpn-sso-auth-dialog"
+else
+    warn "auth-dialog binary not found (gtk4-devel/libadwaita-devel missing?) - GNOME password prompt will not work for requires-password connections."
+fi
 
 # Install NetworkManager plugin file
 info "Installing NetworkManager plugin configuration..."

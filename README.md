@@ -109,16 +109,16 @@ The plugin is built automatically during installation if KDE dependencies are av
 
 ```bash
 # Arch Linux
-sudo pacman -S rust cargo dbus openssl pkgconf
+sudo pacman -S rust cargo dbus openssl pkgconf gtk4 libadwaita
 
 # For KDE Plasma integration (optional)
 sudo pacman -S extra-cmake-modules qt6-base networkmanager-qt kio ki18n kcoreaddons plasma-nm
 
 # Debian/Ubuntu
-sudo apt-get install rustc cargo libdbus-1-dev libssl-dev pkg-config
+sudo apt-get install rustc cargo libdbus-1-dev libssl-dev pkg-config libgtk-4-dev libadwaita-1-dev
 
 # Fedora
-sudo dnf install rust cargo dbus-devel openssl-devel pkg-config
+sudo dnf install rust cargo dbus-devel openssl-devel pkg-config gtk4-devel libadwaita-devel
 ```
 
 ### Build
@@ -182,6 +182,16 @@ sudo ./install.sh
 
 The VPN still works without the plugin—use `nmcli` or `nm-connection-editor` to connect.
 
+### GNOME doesn't prompt for a password on a `requires-password` connection
+
+- Confirm you're in a real graphical GNOME session (not SSH/headless) — GNOME
+  Shell needs to be the one invoking the auth-dialog.
+- Check the binary was installed: `ls /usr/libexec/nm-openvpn-sso-auth-dialog`.
+  If missing, `gtk4-devel`/`libadwaita-devel` were likely not installed at
+  build time — see Prerequisites above and re-run `sudo ./install.sh`.
+- Sanity-check the binary directly: `printf 'DONE\n' | /usr/libexec/nm-openvpn-sso-auth-dialog -u test -n "Test VPN" -s org.freedesktop.NetworkManager.openvpn-sso`
+  should open the dialog.
+
 ## How It Works
 
 1. NetworkManager activates the VPN connection
@@ -190,6 +200,21 @@ The VPN still works without the plugin—use `nmcli` or `nm-connection-editor` t
 4. The plugin opens your browser to the authentication URL
 5. After successful authentication, the server provides credentials
 6. The plugin completes the VPN connection and configures networking
+
+### Servers that require a password before SSO
+
+Some servers require a real username/password login first, and only issue the
+SSO challenge afterwards. Enable this for a connection with:
+
+```bash
+nmcli connection modify "<connection-name>" vpn.data "requires-password=true"
+```
+
+On a GNOME desktop, activating that connection pops a native username/password
+dialog (no `nm-applet` required) before the browser-based SSO step runs. The
+password is not persisted between connection attempts — you'll be prompted on
+every activation. Connections without `requires-password` set are unaffected
+and continue to use pure SSO as before.
 
 ## License
 

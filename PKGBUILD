@@ -6,7 +6,7 @@ pkgdesc="NetworkManager VPN plugin for OpenVPN with SSO/OAuth authentication"
 arch=('x86_64')
 url="https://github.com/pegasusheavy/network-manager-openvpn-sso"
 license=('MIT')
-depends=('networkmanager' 'openvpn' 'libsecret' 'dbus')
+depends=('networkmanager' 'openvpn' 'libsecret' 'dbus' 'gtk4' 'libadwaita')
 makedepends=('cargo' 'rust' 'extra-cmake-modules' 'qt6-base' 'networkmanager-qt' 'kio' 'ki18n' 'kcoreaddons')
 optdepends=('plasma-nm: KDE Plasma network manager integration')
 provides=('networkmanager-openvpn-sso')
@@ -31,6 +31,11 @@ package() {
     # Install binary (same location pattern as nm-openvpn-service)
     install -Dm755 "target/release/nm-openvpn-sso-service" \
         "$pkgdir/usr/lib/nm-openvpn-sso-service"
+
+    # Install GNOME auth-dialog helper (native username/password prompt for
+    # requires-password connections)
+    install -Dm755 "target/release/nm-openvpn-sso-auth-dialog" \
+        "$pkgdir/usr/libexec/nm-openvpn-sso-auth-dialog"
 
     # Install NetworkManager VPN plugin name file
     install -Dm644 "data/nm-openvpn-sso-service.name" \

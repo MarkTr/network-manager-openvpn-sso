@@ -23,7 +23,7 @@ jobs:
             asset_name: nm-openvpn-sso-service-linux-x86_64
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Install system dependencies
         run: |
@@ -31,7 +31,9 @@ jobs:
           sudo apt-get install -y \
             libdbus-1-dev \
             libssl-dev \
-            pkg-config
+            pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,7 +41,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -49,16 +51,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-release-
 
-      - name: Build release binary
+      - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Strip binary
-        run: strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+      - name: Strip binaries
+        run: |
+          strip target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          strip target/${{ matrix.target }}/release/nm-openvpn-sso-auth-dialog
 
       - name: Create tarball
         run: |
           mkdir -p release
           cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} release/
+          cp target/${{ matrix.target }}/release/nm-openvpn-sso-auth-dialog release/
           cp data/nm-openvpn-sso-service.name release/
           cp data/org.freedesktop.NetworkManager.openvpn-sso.conf release/
           cp install.sh release/
@@ -77,7 +82,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Install system dependencies
         run: |
@@ -86,6 +91,8 @@ jobs:
             libdbus-1-dev \
             libssl-dev \
             pkg-config \
+            libgtk-4-dev \
+            libadwaita-1-dev \
             dpkg-dev
 
       - name: Install Rust toolchain
@@ -95,7 +102,7 @@ jobs:
         run: cargo install cargo-deb
 
       - name: Cache cargo registry
-        uses: actions/cache@v6
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -126,7 +133,7 @@ jobs:
       image: fedora:latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
@@ -137,16 +144,20 @@ jobs:
             openssl-devel \
             pkg-config \
             rpm-build \
-            gcc
+            gcc \
+            gtk4-devel \
+            libadwaita-devel
 
       - name: Install cargo-generate-rpm
         run: cargo install cargo-generate-rpm
 
-      - name: Build release binary
+      - name: Build release binaries
         run: cargo build --release
 
-      - name: Strip binary
-        run: strip target/release/nm-openvpn-sso-service
+      - name: Strip binaries
+        run: |
+          strip target/release/nm-openvpn-sso-service
+          strip target/release/nm-openvpn-sso-auth-dialog
 
       - name: Build .rpm package
         run: cargo generate-rpm
@@ -169,7 +180,7 @@ jobs:
       image: archlinux:latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
@@ -181,7 +192,9 @@ jobs:
             dbus \
             openssl \
             pkgconf \
-            git
+            git \
+            gtk4 \
+            libadwaita
 
       - name: Create build user
         run: |
@@ -211,7 +224,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
