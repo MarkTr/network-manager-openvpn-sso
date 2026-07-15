@@ -118,6 +118,7 @@ impl ConnectionConfig {
         // priority over both fallbacks or the username is silently lost.
         let username = get_string(vpn, "user-name")
             .ok()
+            .or_else(|| vpn_secrets.get("user-name").cloned())
             .or_else(|| vpn_secrets.get("username").cloned())
             .or_else(|| vpn_data.get("username").cloned());
 
@@ -470,6 +471,16 @@ mod tests {
         let settings = settings_with(&[("username", "static-user")], &[]);
         let config = ConnectionConfig::from_nm_settings(&settings).unwrap();
         assert_eq!(config.username, Some("static-user".to_string()));
+    }
+
+    #[test]
+    fn falls_back_to_hyphenated_user_name_secret_before_username_secret() {
+        let settings = settings_with(
+            &[("username", "static-user")],
+            &[("user-name", "hyphen-user"), ("username", "no-hyphen-user")],
+        );
+        let config = ConnectionConfig::from_nm_settings(&settings).unwrap();
+        assert_eq!(config.username, Some("hyphen-user".to_string()));
     }
 
     #[test]

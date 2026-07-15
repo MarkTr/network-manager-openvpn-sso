@@ -81,8 +81,12 @@ fn parse_stdin_protocol<R: BufRead>(reader: R) -> StdinContext {
 
 /// Formats the collected secrets per NetworkManager's expected stdout
 /// format: alternating `key\nvalue\n` lines, then a blank-line terminator.
+/// The username key is "user-name" (with a hyphen), matching NetworkManager's
+/// actual VPN setting property name (NM_SETTING_VPN_USER_NAME) — a plain
+/// "username" key isn't recognized and gets silently dropped, leaving NM to
+/// fall back to its own default (the OS account name) instead.
 fn format_secrets_output(username: &str, password: &str) -> String {
-    format!("username\n{}\npassword\n{}\n\n", username, password)
+    format!("user-name\n{}\npassword\n{}\n\n", username, password)
 }
 
 fn main() {
@@ -177,15 +181,26 @@ fn build_window(
     window.connect_close_request(|_| std::process::exit(1));
     cancel_btn.connect_clicked(|_| std::process::exit(1));
 
-    connect_btn.connect_clicked(move |_| {
-        let username = username_row.text();
-        let password = password_row.text();
-        let mut out = std::io::stdout().lock();
-        let _ =
-            out.write_all(format_secrets_output(username.as_str(), password.as_str()).as_bytes());
-        let _ = out.flush();
-        std::process::exit(0);
+    let submit = {
+        let username_row = username_row.clone();
+        let password_row = password_row.clone();
+        move || {
+            let username = username_row.text();
+            let password = password_row.text();
+            let mut out = std::io::stdout().lock();
+            let _ = out
+                .write_all(format_secrets_output(username.as_str(), password.as_str()).as_bytes());
+            let _ = out.flush();
+            std::process::exit(0);
+        }
+    };
+
+    connect_btn.connect_clicked({
+        let submit = submit.clone();
+        move |_| submit()
     });
+    // Pressing Enter in the password field submits, same as clicking Connect.
+    password_row.connect_entry_activated(move |_| submit());
 
     window.present();
 }
@@ -234,7 +249,7 @@ mod tests {
     #[test]
     fn formats_secrets_output_with_terminator() {
         let out = format_secrets_output("alice", "s3cret");
-        assert_eq!(out, "username\nalice\npassword\ns3cret\n\n");
+        assert_eq!(out, "user-name\nalice\npassword\ns3cret\n\n");
     }
 
     #[test]
