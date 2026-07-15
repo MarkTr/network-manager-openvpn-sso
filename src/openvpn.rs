@@ -293,6 +293,65 @@ impl OpenVpnManager {
 
                     // First time we get password request
                     if !initial_auth_sent {
+                        // Servers that require a real login before the SSO challenge:
+                        // send the real username/password NM obtained via the
+                        // auth-dialog. Never fall back to a placeholder here — sending
+                        // bogus credentials to a server that actually validates them
+                        // is worse than failing visibly.
+                        if self.config.requires_password {
+                            let username =
+                                self.config.username.as_deref().filter(|s| !s.is_empty());
+                            let password =
+                                self.config.password.as_deref().filter(|s| !s.is_empty());
+
+                            let (username, password) = match (username, password) {
+                                (Some(u), Some(p)) => (u, p),
+                                _ => {
+                                    error!(
+                                        "requires_password=true but no username/password available \
+                                         at first PASSWORD prompt (expected them via NM NeedSecrets)"
+                                    );
+                                    self.event_tx
+                                        .send(VpnEvent::Failed(
+                                            "This VPN requires a username and password, but none were provided"
+                                                .to_string(),
+                                        ))
+                                        .await
+                                        .ok();
+                                    return Err(anyhow!(
+                                        "Missing required username/password for requires_password connection"
+                                    ));
+                                }
+                            };
+
+                            info!(
+                                "Sending real username/password credentials to initiate login..."
+                            );
+                            writer
+                                .write_all(
+                                    format!(
+                                        "username \"Auth\" \"{}\"\n",
+                                        escape_management_string(username)
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await?;
+                            writer
+                                .write_all(
+                                    format!(
+                                        "password \"Auth\" \"{}\"\n",
+                                        escape_management_string(password)
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await?;
+                            writer.flush().await?;
+
+                            initial_auth_sent = true;
+                            info!("Sent real credentials, waiting for server response...");
+                            continue;
+                        }
+
                         // Try cached credentials first if available
                         if let Some(ref tokens) = cached_token {
                             if tokens.is_valid() && !used_cached_token {

@@ -50,6 +50,9 @@ pub struct ConnectionConfig {
     pub remote_cert_tls: Option<String>,
     /// Connection type: tls, password, etc. (from vpn.data "connection-type")
     pub connection_type: Option<String>,
+    /// Whether this server requires a real username/password login before
+    /// the SSO/OAuth challenge (from vpn.data "requires-password", default false)
+    pub requires_password: bool,
 }
 
 impl ConnectionConfig {
@@ -87,6 +90,10 @@ impl ConnectionConfig {
         let dev = vpn_data.get("dev").cloned();
         let remote_cert_tls = vpn_data.get("remote-cert-tls").cloned();
         let connection_type = vpn_data.get("connection-type").cloned();
+        let requires_password = vpn_data
+            .get("requires-password")
+            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+            .unwrap_or(false);
 
         // Validate: need either a config file or at least a CA cert
         if config_path.is_none() && ca.is_none() {
@@ -98,11 +105,16 @@ impl ConnectionConfig {
         let remote = vpn_data.get("remote").cloned();
         let port = vpn_data.get("port").and_then(|p| p.parse().ok());
         let protocol = vpn_data.get("proto").cloned();
-        let username = vpn_data.get("username").cloned();
 
-        // Get secrets section for password
+        // Get secrets section for password (and a live-entered username, which
+        // takes priority over a static vpn.data username when present — the
+        // auth-dialog for requires_password connections writes both back as secrets)
         let vpn_secrets = get_string_dict(vpn, "secrets").unwrap_or_default();
         let password = vpn_secrets.get("password").cloned();
+        let username = vpn_secrets
+            .get("username")
+            .cloned()
+            .or_else(|| vpn_data.get("username").cloned());
 
         Ok(Self {
             uuid,
@@ -124,7 +136,15 @@ impl ConnectionConfig {
             dev,
             remote_cert_tls,
             connection_type,
+            requires_password,
         })
+    }
+
+    /// Whether NetworkManager still needs to fetch a real password (and username)
+    /// from the user/secret-agent before Connect can proceed. Always false when
+    /// `requires_password` is false — a strict superset of the pure-SSO behavior.
+    pub fn needs_password_secrets(&self) -> bool {
+        self.requires_password && self.password.as_deref().map(str::is_empty).unwrap_or(true)
     }
 
     /// Build OpenVPN command line arguments
@@ -206,11 +226,9 @@ impl ConnectionConfig {
                         port.to_string(),
                         proto.to_string(),
                     ]),
-                    [host, port] => args.extend([
-                        "--remote".to_string(),
-                        host.to_string(),
-                        port.to_string(),
-                    ]),
+                    [host, port] => {
+                        args.extend(["--remote".to_string(), host.to_string(), port.to_string()])
+                    }
                     [host] => args.extend(["--remote".to_string(), host.to_string()]),
                     _ => {}
                 }
@@ -305,4 +323,197 @@ fn get_string_dict(
             Some(result)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zbus::zvariant::Value;
+
+    fn str_value(s: &str) -> OwnedValue {
+        OwnedValue::try_from(Value::from(s.to_string())).unwrap()
+    }
+
+    fn dict_value(map: HashMap<String, String>) -> OwnedValue {
+        OwnedValue::from(map)
+    }
+
+    fn settings_with(
+        vpn_data: &[(&str, &str)],
+        vpn_secrets: &[(&str, &str)],
+    ) -> HashMap<String, HashMap<String, OwnedValue>> {
+        let mut connection = HashMap::new();
+        connection.insert("uuid".to_string(), str_value("test-uuid"));
+        connection.insert("id".to_string(), str_value("Test VPN"));
+
+        let mut data: HashMap<String, String> = vpn_data
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        // Every fixture needs either a config path or a CA cert to pass validation.
+        data.entry("ca".to_string())
+            .or_insert_with(|| "/etc/test-ca.pem".to_string());
+
+        let secrets: HashMap<String, String> = vpn_secrets
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
+        let mut vpn = HashMap::new();
+        vpn.insert("data".to_string(), dict_value(data));
+        if !secrets.is_empty() {
+            vpn.insert("secrets".to_string(), dict_value(secrets));
+        }
+
+        let mut settings = HashMap::new();
+        settings.insert("connection".to_string(), connection);
+        settings.insert("vpn".to_string(), vpn);
+        settings
+    }
+
+    #[test]
+    fn requires_password_defaults_to_false_when_absent() {
+        let settings = settings_with(&[], &[]);
+        let config = ConnectionConfig::from_nm_settings(&settings).unwrap();
+        assert!(!config.requires_password);
+    }
+
+    #[test]
+    fn requires_password_parses_truthy_and_falsy_values() {
+        for (raw, expected) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("false", false),
+            ("0", false),
+            ("garbage", false),
+        ] {
+            let settings = settings_with(&[("requires-password", raw)], &[]);
+            let config = ConnectionConfig::from_nm_settings(&settings).unwrap();
+            assert_eq!(config.requires_password, expected, "input {:?}", raw);
+        }
+    }
+
+    #[test]
+    fn username_falls_back_to_vpn_data_when_no_secret_present() {
+        let settings = settings_with(&[("username", "static-user")], &[]);
+        let config = ConnectionConfig::from_nm_settings(&settings).unwrap();
+        assert_eq!(config.username, Some("static-user".to_string()));
+    }
+
+    #[test]
+    fn username_secret_overrides_vpn_data_username() {
+        let settings = settings_with(
+            &[("username", "static-user")],
+            &[("username", "live-user"), ("password", "s3cret")],
+        );
+        let config = ConnectionConfig::from_nm_settings(&settings).unwrap();
+        assert_eq!(config.username, Some("live-user".to_string()));
+        assert_eq!(config.password, Some("s3cret".to_string()));
+    }
+
+    #[test]
+    fn username_is_none_when_neither_source_has_it() {
+        let settings = settings_with(&[], &[]);
+        let config = ConnectionConfig::from_nm_settings(&settings).unwrap();
+        assert_eq!(config.username, None);
+    }
+
+    #[test]
+    fn needs_password_secrets_is_false_superset_when_not_required() {
+        let settings = settings_with(&[], &[]);
+        let mut config = ConnectionConfig::from_nm_settings(&settings).unwrap();
+        assert!(!config.needs_password_secrets());
+
+        config.password = Some("anything".to_string());
+        assert!(!config.needs_password_secrets());
+    }
+
+    #[test]
+    fn needs_password_secrets_truth_table() {
+        let settings = settings_with(&[("requires-password", "true")], &[]);
+        let mut config = ConnectionConfig::from_nm_settings(&settings).unwrap();
+        assert!(config.password.is_none());
+        assert!(config.needs_password_secrets());
+
+        config.password = Some(String::new());
+        assert!(config.needs_password_secrets());
+
+        config.password = Some("real-password".to_string());
+        assert!(!config.needs_password_secrets());
+    }
+
+    fn base_config() -> ConnectionConfig {
+        ConnectionConfig {
+            uuid: "test-uuid".to_string(),
+            id: "Test VPN".to_string(),
+            config_path: Some(PathBuf::from("/etc/openvpn/test.ovpn")),
+            remote: None,
+            port: None,
+            protocol: None,
+            username: None,
+            password: None,
+            extra_args: Vec::new(),
+            ca: None,
+            cert: None,
+            key: None,
+            ta: None,
+            ta_dir: None,
+            cipher: None,
+            auth: None,
+            dev: None,
+            remote_cert_tls: None,
+            connection_type: None,
+            requires_password: false,
+        }
+    }
+
+    #[test]
+    fn build_openvpn_args_includes_push_peer_info() {
+        let args = base_config().build_openvpn_args("/tmp/sock");
+        assert!(args.iter().any(|a| a == "--push-peer-info"));
+    }
+
+    #[test]
+    fn build_openvpn_args_splits_multi_remote_host_port_proto() {
+        let mut config = base_config();
+        config.remote = Some("vpn.example.com:1194:udp, vpn2.example.com:443:tcp".to_string());
+        let args = config.build_openvpn_args("/tmp/sock");
+
+        let remote_positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--remote")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(remote_positions.len(), 2);
+        assert_eq!(
+            &args[remote_positions[0] + 1..remote_positions[0] + 4],
+            &["vpn.example.com", "1194", "udp"]
+        );
+        assert_eq!(
+            &args[remote_positions[1] + 1..remote_positions[1] + 4],
+            &["vpn2.example.com", "443", "tcp"]
+        );
+    }
+
+    #[test]
+    fn build_openvpn_args_handles_host_port_only() {
+        let mut config = base_config();
+        config.remote = Some("vpn.example.com:1194".to_string());
+        let args = config.build_openvpn_args("/tmp/sock");
+
+        let idx = args.iter().position(|a| a == "--remote").unwrap();
+        assert_eq!(&args[idx + 1..idx + 3], &["vpn.example.com", "1194"]);
+    }
+
+    #[test]
+    fn build_openvpn_args_handles_host_only() {
+        let mut config = base_config();
+        config.remote = Some("vpn.example.com".to_string());
+        let args = config.build_openvpn_args("/tmp/sock");
+
+        let idx = args.iter().position(|a| a == "--remote").unwrap();
+        assert_eq!(&args[idx + 1], "vpn.example.com");
+    }
 }

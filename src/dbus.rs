@@ -195,6 +195,14 @@ impl VpnPlugin {
             config.uuid, config.id, config.config_path, config.ca
         );
 
+        // Servers that require a real username/password login before the SSO
+        // challenge: tell NM to fetch them (via the auth-dialog) before Connect.
+        // Pure-SSO connections (the default) never hit this branch.
+        if config.needs_password_secrets() {
+            info!("Connection requires a real password and none is available yet — requesting 'vpn' secrets");
+            return Ok("vpn".to_string());
+        }
+
         // Check if we have cached credentials
         if let Some(tokens) = secrets::get_cached_credentials(&config.uuid).await {
             if tokens.is_valid() {
