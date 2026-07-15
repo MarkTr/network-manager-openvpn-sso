@@ -6,3 +6,7 @@ supports-multiple-connections=false
 
 [libnm]
 plugin=libnm-vpn-plugin-openvpn-sso.so
+
+[GNOME]
+auth-dialog=/usr/libexec/nm-openvpn-sso-auth-dialog
+supports-hints=true

@@ -14,6 +14,10 @@ categories = ["network-programming", "authentication"]
 name = "nm-openvpn-sso-service"
 path = "src/main.rs"
 
+[[bin]]
+name = "nm-openvpn-sso-auth-dialog"
+path = "src/bin/auth_dialog.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -55,6 +59,11 @@ uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 notify-rust = "4"
 
+# GNOME auth-dialog helper binary (native username/password prompt)
+gtk4 = { version = "0.11", features = ["gnome_50"] }
+libadwaita = { version = "0.9", features = ["v1_4"] }
+clap = { version = "4", features = ["derive"] }
+
 [profile.release]
 lto = true
 strip = true
@@ -75,6 +84,7 @@ section = "net"
 priority = "optional"
 assets = [
     ["target/release/nm-openvpn-sso-service", "/usr/lib/nm-openvpn-sso-service", "755"],
+    ["target/release/nm-openvpn-sso-auth-dialog", "/usr/libexec/nm-openvpn-sso-auth-dialog", "755"],
     ["data/nm-openvpn-sso-service.name", "/usr/lib/NetworkManager/VPN/nm-openvpn-sso-service.name", "644"],
     ["data/org.freedesktop.NetworkManager.openvpn-sso.conf", "/usr/share/dbus-1/system.d/nm-openvpn-sso-service.conf", "644"],
     ["data/vpn-sso-connect.sh", "/usr/bin/vpn-sso-connect", "755"],
@@ -88,6 +98,7 @@ name = "networkmanager-openvpn-sso"
 license = "MIT"
 assets = [
     { source = "target/release/nm-openvpn-sso-service", dest = "/usr/lib/nm-openvpn-sso-service", mode = "755" },
+    { source = "target/release/nm-openvpn-sso-auth-dialog", dest = "/usr/libexec/nm-openvpn-sso-auth-dialog", mode = "755" },
     { source = "data/nm-openvpn-sso-service.name", dest = "/usr/lib/NetworkManager/VPN/nm-openvpn-sso-service.name", mode = "644" },
     { source = "data/org.freedesktop.NetworkManager.openvpn-sso.conf", dest = "/usr/share/dbus-1/system.d/nm-openvpn-sso-service.conf", mode = "644" },
     { source = "data/vpn-sso-connect.sh", dest = "/usr/bin/vpn-sso-connect", mode = "755" },
@@ -98,3 +109,5 @@ assets = [
 [package.metadata.generate-rpm.requires]
 NetworkManager = "*"
 openvpn = "*"
+gtk4 = "*"
+libadwaita = "*"
