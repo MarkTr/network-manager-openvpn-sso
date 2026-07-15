@@ -277,6 +277,12 @@ impl OpenVpnManager {
                         }
                     } else {
                         error!("Verification failed but no auth URL found in response");
+                        self.event_tx
+                            .send(VpnEvent::Failed(
+                                "Auth verification failed without providing SSO URL".to_string(),
+                            ))
+                            .await
+                            .ok();
                         return Err(anyhow!(
                             "Auth verification failed without providing SSO URL"
                         ));

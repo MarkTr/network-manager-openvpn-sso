@@ -206,10 +206,15 @@ impl ConnectionConfig {
             "--management-hold".to_string(),
             "--script-security".to_string(),
             "2".to_string(),
-            // Required for server-side SSO plugins (e.g. openvpn-auth-oauth2): without
-            // peer-info, the server never learns the client supports IV_SSO=webauth and
-            // just rejects the initial placeholder credentials instead of returning an
-            // auth URL challenge. Most .ovpn files don't set this themselves.
+            // Required for server-side SSO plugins (e.g. openvpn-auth-oauth2): --push-peer-info
+            // alone does NOT advertise SSO capability — IV_SSO must be set explicitly, and only
+            // then does --push-peer-info transmit it. Without it, the server has no way to know
+            // this client can do a browser-based flow and falls back to its legacy/non-SSO auth
+            // path (e.g. a CRV1 challenge) instead of returning an auth URL challenge. Most .ovpn
+            // files don't set this themselves; OpenVPN3-based clients set it automatically.
+            "--setenv".to_string(),
+            "IV_SSO".to_string(),
+            "webauth".to_string(),
             "--push-peer-info".to_string(),
         ]);
 
@@ -491,6 +496,16 @@ mod tests {
     fn build_openvpn_args_includes_push_peer_info() {
         let args = base_config().build_openvpn_args("/tmp/sock");
         assert!(args.iter().any(|a| a == "--push-peer-info"));
+    }
+
+    #[test]
+    fn build_openvpn_args_advertises_iv_sso_webauth() {
+        let args = base_config().build_openvpn_args("/tmp/sock");
+        let idx = args
+            .iter()
+            .position(|a| a == "--setenv")
+            .expect("--setenv IV_SSO webauth must be present");
+        assert_eq!(&args[idx + 1..idx + 3], &["IV_SSO", "webauth"]);
     }
 
     #[test]
