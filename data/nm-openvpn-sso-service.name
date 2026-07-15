@@ -3,3 +3,6 @@ name=openvpn-sso
 service=org.freedesktop.NetworkManager.openvpn-sso
 program=/usr/lib/nm-openvpn-sso-service
 supports-multiple-connections=false
+
+[libnm]
+plugin=libnm-vpn-plugin-openvpn-sso.so
