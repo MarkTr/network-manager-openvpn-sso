@@ -111,9 +111,14 @@ impl ConnectionConfig {
         // auth-dialog for requires_password connections writes both back as secrets)
         let vpn_secrets = get_string_dict(vpn, "secrets").unwrap_or_default();
         let password = vpn_secrets.get("password").cloned();
-        let username = vpn_secrets
-            .get("username")
-            .cloned()
+        // NetworkManager has a dedicated top-level "user-name" property on the "vpn"
+        // setting (a sibling of "data"/"secrets", NM_SETTING_VPN_USER_NAME) — for
+        // connection-type=password connections it routes the auth-dialog's collected
+        // username there instead of leaving it in vpn.secrets, so it must take
+        // priority over both fallbacks or the username is silently lost.
+        let username = get_string(vpn, "user-name")
+            .ok()
+            .or_else(|| vpn_secrets.get("username").cloned())
             .or_else(|| vpn_data.get("username").cloned());
 
         Ok(Self {
@@ -443,6 +448,28 @@ mod tests {
         let config = ConnectionConfig::from_nm_settings(&settings).unwrap();
         assert_eq!(config.username, Some("live-user".to_string()));
         assert_eq!(config.password, Some("s3cret".to_string()));
+    }
+
+    #[test]
+    fn top_level_vpn_user_name_takes_priority_over_secrets_and_data() {
+        let mut settings = settings_with(
+            &[("username", "static-user")],
+            &[("username", "secrets-user"), ("password", "s3cret")],
+        );
+        settings
+            .get_mut("vpn")
+            .unwrap()
+            .insert("user-name".to_string(), str_value("mark"));
+        let config = ConnectionConfig::from_nm_settings(&settings).unwrap();
+        assert_eq!(config.username, Some("mark".to_string()));
+        assert_eq!(config.password, Some("s3cret".to_string()));
+    }
+
+    #[test]
+    fn falls_back_when_top_level_vpn_user_name_absent() {
+        let settings = settings_with(&[("username", "static-user")], &[]);
+        let config = ConnectionConfig::from_nm_settings(&settings).unwrap();
+        assert_eq!(config.username, Some("static-user".to_string()));
     }
 
     #[test]
