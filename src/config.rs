@@ -171,7 +171,15 @@ impl ConnectionConfig {
                 "--dev".to_string(),
                 self.dev.clone().unwrap_or_else(|| "tun".to_string()),
                 "--persist-key".to_string(),
-                "--persist-tun".to_string(),
+                // Deliberately NOT --persist-tun: it keeps the tun/tap device alive
+                // across the openvpn process's own internal restarts (SIGUSR1,
+                // --ping-restart) by design, but this plugin has no per-connection
+                // tracking of the assigned device name to clean it up afterward — so
+                // with this flag, the interface silently outlives the process on any
+                // exit path (explicit disconnect from the NM GUI, a lost connection,
+                // a crash), leaving a dangling tunX device behind. NetworkManager
+                // expects to fully own the interface's lifecycle for the connections
+                // it manages, so let openvpn tear its device down on exit as normal.
                 "--resolv-retry".to_string(),
                 "infinite".to_string(),
                 // Every connection this plugin drives expects a live username/password
@@ -549,6 +557,20 @@ mod tests {
             args.iter().any(|a| a == "--auth-user-pass"),
             "NM-imported connections need --auth-user-pass or OpenVPN refuses to start \
              with no --cert/--key/--pkcs12 configured either"
+        );
+    }
+
+    #[test]
+    fn build_openvpn_args_nm_imported_mode_omits_persist_tun() {
+        let mut config = base_config();
+        config.config_path = None;
+        config.ca = Some("/etc/openvpn/ca.pem".to_string());
+        let args = config.build_openvpn_args("/tmp/sock");
+        assert!(
+            !args.iter().any(|a| a == "--persist-tun"),
+            "--persist-tun keeps the tun device alive after the openvpn process exits, \
+             but this plugin has no way to clean it up afterward, leaving a dangling \
+             interface on disconnect or a lost connection"
         );
     }
 
