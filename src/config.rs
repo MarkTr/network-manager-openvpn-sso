@@ -186,6 +186,11 @@ impl ConnectionConfig {
             "--management-hold".to_string(),
             "--script-security".to_string(),
             "2".to_string(),
+            // Required for server-side SSO plugins (e.g. openvpn-auth-oauth2): without
+            // peer-info, the server never learns the client supports IV_SSO=webauth and
+            // just rejects the initial placeholder credentials instead of returning an
+            // auth URL challenge. Most .ovpn files don't set this themselves.
+            "--push-peer-info".to_string(),
         ]);
 
         // Common: apply overrides
