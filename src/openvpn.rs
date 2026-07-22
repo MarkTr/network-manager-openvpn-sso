@@ -85,6 +85,10 @@ pub struct OpenVpnManager {
     /// Auth token received from server after successful authentication
     /// This can be used for reconnection without browser auth
     auth_token: Option<String>,
+    /// Local tunnel IP captured once the CONNECTED state is reached, used at
+    /// disconnect time to find and force-remove a lingering DCO interface
+    /// (see `find_interface_by_ip`/`delete_interface`)
+    connected_local_ip: Option<String>,
 }
 
 impl OpenVpnManager {
@@ -99,6 +103,7 @@ impl OpenVpnManager {
             pending_auth_url: None,
             sso_auth_initiated: false,
             auth_token: None,
+            connected_local_ip: None,
         }
     }
 
@@ -644,6 +649,16 @@ impl OpenVpnManager {
                                 vpn_config.remote_ip = Some(parts[4].to_string());
                             }
 
+                            // The >STATE: message has no device-name field, so
+                            // resolve it from the local tunnel IP instead. Kept
+                            // on self (not just the local vpn_config) so it
+                            // survives into a later disconnect() call on this
+                            // same instance for DCO interface cleanup.
+                            self.connected_local_ip = vpn_config.local_ip.clone();
+                            if let Some(ref ip) = vpn_config.local_ip {
+                                vpn_config.tun_device = find_interface_by_ip(ip).await;
+                            }
+
                             // Save credentials for future reconnections
                             self.save_credentials_after_connect().await;
 
@@ -849,8 +864,18 @@ impl OpenVpnManager {
                 let (_, mut writer) = stream.into_split();
                 let _ = writer.write_all(b"signal SIGTERM\n").await;
 
-                // Give it a moment to shut down gracefully
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                // Poll for exit instead of a blind sleep: DCO (Data Channel
+                // Offload) kernel interfaces are torn down via netlink only by
+                // OpenVPN's own graceful-exit code, which can take longer than
+                // a fixed delay. Only escalate to SIGKILL once the grace
+                // period truly elapses, since SIGKILL bypasses that teardown
+                // entirely and orphans the interface.
+                for _ in 0..25 {
+                    if let Ok(Some(_)) = child.try_wait() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
             }
 
             // Force kill if still running
@@ -862,6 +887,20 @@ impl OpenVpnManager {
 
         // Clean up socket
         let _ = tokio::fs::remove_file(&self.socket_path).await;
+
+        // Safety net: if OpenVPN's own shutdown didn't tear down the tunnel
+        // interface (e.g. it was SIGKILLed above, orphaning a DCO interface),
+        // force-remove it by looking up the device that held the connection's
+        // local IP.
+        if let Some(ip) = self.connected_local_ip.take() {
+            if let Some(device) = find_interface_by_ip(&ip).await {
+                info!(
+                    "Tunnel interface {} still present after disconnect, removing it",
+                    device
+                );
+                delete_interface(&device).await;
+            }
+        }
 
         self.event_tx
             .send(VpnEvent::State(VpnState::Stopped))
@@ -1055,6 +1094,68 @@ fn escape_management_string(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
+/// Find the network interface currently holding the given IP address, by
+/// parsing `ip -o addr show`. Used to identify the tunnel device since
+/// OpenVPN's `>STATE:...,CONNECTED,...` management message carries the local
+/// IP but no device name.
+async fn find_interface_by_ip(ip: &str) -> Option<String> {
+    let output = Command::new("ip")
+        .args(["-o", "addr", "show"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_interface_by_ip(&text, ip)
+}
+
+/// Parse `ip -o addr show` output to find the interface holding `ip`, either
+/// as its address or (for point-to-point tun devices) its peer address.
+fn parse_interface_by_ip(ip_addr_show_output: &str, ip: &str) -> Option<String> {
+    let peer_prefix = format!("{}/", ip);
+    for line in ip_addr_show_output.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 2 {
+            continue;
+        }
+        if tokens
+            .iter()
+            .any(|t| *t == ip || t.starts_with(&peer_prefix))
+        {
+            return Some(tokens[1].trim_end_matches(':').to_string());
+        }
+    }
+    None
+}
+
+/// Best-effort removal of a network interface. DCO (Data Channel Offload)
+/// tunnel interfaces are netlink-managed and only get torn down by OpenVPN's
+/// own graceful exit; a SIGKILL bypasses that, orphaning the interface. This
+/// is a fallback safety net, so failures are logged but not propagated.
+async fn delete_interface(name: &str) {
+    match Command::new("ip")
+        .args(["link", "delete", name])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            info!("Removed lingering tunnel interface {}", name);
+        }
+        Ok(output) => {
+            warn!(
+                "Failed to remove tunnel interface {}: {}",
+                name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(e) => {
+            warn!("Failed to run 'ip link delete {}': {}", name, e);
+        }
+    }
+}
+
 impl Drop for OpenVpnManager {
     fn drop(&mut self) {
         if let Some(ref mut child) = self.process {
@@ -1063,5 +1164,52 @@ impl Drop for OpenVpnManager {
         }
         // Clean up socket
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_interface_by_ip_finds_point_to_point_tun_device() {
+        let output = "4: tun0    inet 192.168.136.158 peer 192.168.136.157/32 scope global tun0\\       valid_lft forever preferred_lft forever";
+        assert_eq!(
+            parse_interface_by_ip(output, "192.168.136.158"),
+            Some("tun0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_interface_by_ip_finds_plain_address_with_prefix() {
+        let output = "2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global dynamic eth0\\       valid_lft forever preferred_lft forever";
+        assert_eq!(
+            parse_interface_by_ip(output, "10.0.0.5"),
+            Some("eth0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_interface_by_ip_matches_correct_line_among_several() {
+        let output = "\
+2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global dynamic eth0
+4: tun0    inet 192.168.136.158 peer 192.168.136.157/32 scope global tun0";
+        assert_eq!(
+            parse_interface_by_ip(output, "192.168.136.158"),
+            Some("tun0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_interface_by_ip_returns_none_when_not_found() {
+        let output = "2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global dynamic eth0";
+        assert_eq!(parse_interface_by_ip(output, "192.168.136.158"), None);
+    }
+
+    #[test]
+    fn parse_interface_by_ip_does_not_match_ip_prefix_substring() {
+        // "192.168.136.15" must not match the interface holding "192.168.136.158"
+        let output = "4: tun0    inet 192.168.136.158 peer 192.168.136.157/32 scope global tun0";
+        assert_eq!(parse_interface_by_ip(output, "192.168.136.15"), None);
     }
 }
