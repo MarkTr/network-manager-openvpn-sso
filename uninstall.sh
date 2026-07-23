@@ -25,6 +25,11 @@ info "Stopping service..."
 systemctl stop nm-openvpn-sso.service 2>/dev/null || true
 systemctl disable nm-openvpn-sso.service 2>/dev/null || true
 
+if command -v semodule &> /dev/null; then
+    info "Removing SELinux policy module..."
+    semodule -r nm_openvpn_sso 2>/dev/null || true
+fi
+
 info "Removing files..."
 rm -f "$LIBDIR/nm-openvpn-sso-service"
 rm -f "$LIBDIR/NetworkManager/VPN/nm-openvpn-sso-service.name"

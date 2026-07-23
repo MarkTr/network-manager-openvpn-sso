@@ -4,6 +4,12 @@
 # CMake build artifacts
 plasma-nm-plugin/build/
 
+# SELinux policy module build artifacts
+selinux/*.pp
+selinux/*.fc
+selinux/*.if
+selinux/tmp/
+
 # Arch Linux package build artifacts
 pkg/
 *.pkg.tar.zst

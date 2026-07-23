@@ -1,0 +1,35 @@
+policy_module(nm_openvpn_sso, 1.0.0)
+
+########################################
+#
+# NetworkManager execs this plugin's daemon directly and it ships no SELinux
+# domain of its own, so it inherits NetworkManager_t. This module grants
+# that domain the extra permissions it needs beyond what the classic
+# (non-SSO) openvpn plugin already requires -- everything else (spawning
+# openvpn, secrets, D-Bus system bus, etc.) already works under
+# NetworkManager_t's existing policy.
+
+require {
+    type NetworkManager_t;
+}
+
+# --- OpenVPN management interface ---------------------------------------
+# The management socket lives under /run/openvpn (openvpn_var_run_t) --
+# openvpn's own existing runtime directory -- instead of a generic /tmp
+# path, so openvpn_t creating/binding/unlinking it is already covered by
+# its own pre-existing policy (confirmed via AVC: openvpn_t was denied
+# unlink on a /tmp-labeled socket file, which isn't its designated runtime
+# location). This grants the client side: connecting to that socket from
+# NetworkManager_t.
+openvpn_stream_connect(NetworkManager_t)
+
+# --- Browser-based SSO/OAuth flow ---------------------------------------
+# Opening a browser in the invoking user's desktop session for the
+# AUTH_PENDING/WEB_AUTH SSO challenge requires reaching that user's own
+# session D-Bus daemon. NetworkManager_t has no policy for this by
+# default, since the classic (non-SSO) openvpn plugin never needs it.
+# Confirmed via AVC: connectto on unconfined_dbusd_t, write on
+# session_dbusd_tmp_t, and system:start on init_t were all denied.
+dbus_stream_connect_session_bus(NetworkManager_t)
+dbus_write_session_tmp_sock_files(NetworkManager_t)
+init_start(NetworkManager_t)

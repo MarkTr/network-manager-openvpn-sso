@@ -106,6 +106,23 @@ else
     warn "KDE Plasma users: install extra-cmake-modules, qt6-base, networkmanager-qt, kio, ki18n, kcoreaddons, plasma-nm and re-run."
 fi
 
+# On SELinux systems, NetworkManager_t (this service inherits it, having no
+# domain of its own) is missing a couple of permissions the classic
+# (non-SSO) openvpn plugin never needed: connecting to the management
+# socket under /run/openvpn, and reaching the invoking user's session
+# D-Bus to launch a browser for the SSO web-auth flow. Build and load a
+# small supplementary policy module granting exactly those.
+if command -v getenforce &> /dev/null && [[ "$(getenforce)" != "Disabled" ]]; then
+    if command -v checkmodule &> /dev/null && command -v semodule_package &> /dev/null \
+        && command -v semodule &> /dev/null && [[ -f /usr/share/selinux/devel/Makefile ]]; then
+        info "Building and loading SELinux policy module..."
+        make -C selinux -f /usr/share/selinux/devel/Makefile
+        semodule -i selinux/nm_openvpn_sso.pp
+    else
+        warn "selinux-policy-devel/checkpolicy/policycoreutils not found - skipping SELinux policy module. Connections may fail under enforcing mode without it."
+    fi
+fi
+
 # Reload daemons
 info "Reloading system daemons..."
 dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
