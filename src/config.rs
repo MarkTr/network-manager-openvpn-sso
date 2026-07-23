@@ -154,7 +154,7 @@ impl ConnectionConfig {
     }
 
     /// Build OpenVPN command line arguments
-    pub fn build_openvpn_args(&self, management_socket: &str) -> Vec<String> {
+    pub fn build_openvpn_args(&self, management_port: u16) -> Vec<String> {
         let mut args = Vec::new();
 
         if let Some(ref config_path) = self.config_path {
@@ -220,11 +220,16 @@ impl ConnectionConfig {
             }
         }
 
-        // Common: management interface
+        // Common: management interface. A loopback TCP socket is used instead
+        // of a Unix socket file: OpenVPN's own SELinux policy on some distros
+        // doesn't expect it to unlink/bind arbitrary paths, and NetworkManager's
+        // policy doesn't expect it to stat one either — both denials were
+        // observed in practice, and neither is an issue for a plain loopback
+        // TCP connection (no filesystem object for SELinux to confine).
         args.extend([
             "--management".to_string(),
-            management_socket.to_string(),
-            "unix".to_string(),
+            "127.0.0.1".to_string(),
+            management_port.to_string(),
             "--management-query-passwords".to_string(),
             "--management-hold".to_string(),
             "--script-security".to_string(),
@@ -552,7 +557,7 @@ mod tests {
         let mut config = base_config();
         config.config_path = None;
         config.ca = Some("/etc/openvpn/ca.pem".to_string());
-        let args = config.build_openvpn_args("/tmp/sock");
+        let args = config.build_openvpn_args(12345);
         assert!(
             args.iter().any(|a| a == "--auth-user-pass"),
             "NM-imported connections need --auth-user-pass or OpenVPN refuses to start \
@@ -565,7 +570,7 @@ mod tests {
         let mut config = base_config();
         config.config_path = None;
         config.ca = Some("/etc/openvpn/ca.pem".to_string());
-        let args = config.build_openvpn_args("/tmp/sock");
+        let args = config.build_openvpn_args(12345);
         assert!(
             !args.iter().any(|a| a == "--persist-tun"),
             "--persist-tun keeps the tun device alive after the openvpn process exits, \
@@ -576,13 +581,29 @@ mod tests {
 
     #[test]
     fn build_openvpn_args_includes_push_peer_info() {
-        let args = base_config().build_openvpn_args("/tmp/sock");
+        let args = base_config().build_openvpn_args(12345);
         assert!(args.iter().any(|a| a == "--push-peer-info"));
     }
 
     #[test]
+    fn build_openvpn_args_uses_loopback_tcp_management_port() {
+        let args = base_config().build_openvpn_args(12345);
+        let idx = args
+            .iter()
+            .position(|a| a == "--management")
+            .expect("--management must be present");
+        assert_eq!(&args[idx + 1..idx + 3], &["127.0.0.1", "12345"]);
+        assert!(
+            !args.iter().any(|a| a == "unix"),
+            "management interface must be a loopback TCP socket, not a Unix \
+             socket file — distro SELinux policy denies openvpn_t/NetworkManager_t \
+             from unlinking/statting arbitrary tmp_t paths"
+        );
+    }
+
+    #[test]
     fn build_openvpn_args_advertises_iv_sso_webauth() {
-        let args = base_config().build_openvpn_args("/tmp/sock");
+        let args = base_config().build_openvpn_args(12345);
         let idx = args
             .iter()
             .position(|a| a == "--setenv")
@@ -594,7 +615,7 @@ mod tests {
     fn build_openvpn_args_splits_multi_remote_host_port_proto() {
         let mut config = base_config();
         config.remote = Some("vpn.example.com:1194:udp, vpn2.example.com:443:tcp".to_string());
-        let args = config.build_openvpn_args("/tmp/sock");
+        let args = config.build_openvpn_args(12345);
 
         let remote_positions: Vec<usize> = args
             .iter()
@@ -617,7 +638,7 @@ mod tests {
     fn build_openvpn_args_handles_host_port_only() {
         let mut config = base_config();
         config.remote = Some("vpn.example.com:1194".to_string());
-        let args = config.build_openvpn_args("/tmp/sock");
+        let args = config.build_openvpn_args(12345);
 
         let idx = args.iter().position(|a| a == "--remote").unwrap();
         assert_eq!(&args[idx + 1..idx + 3], &["vpn.example.com", "1194"]);
@@ -627,7 +648,7 @@ mod tests {
     fn build_openvpn_args_handles_host_only() {
         let mut config = base_config();
         config.remote = Some("vpn.example.com".to_string());
-        let args = config.build_openvpn_args("/tmp/sock");
+        let args = config.build_openvpn_args(12345);
 
         let idx = args.iter().position(|a| a == "--remote").unwrap();
         assert_eq!(&args[idx + 1], "vpn.example.com");
