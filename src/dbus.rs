@@ -115,6 +115,7 @@ impl VpnPlugin {
                 state.vpn_manager.take()
             };
 
+            let mut connect_failed = false;
             if let Some(ref mut mgr) = manager {
                 match mgr.connect().await {
                     Ok(()) => {
@@ -122,14 +123,29 @@ impl VpnPlugin {
                     }
                     Err(e) => {
                         error!("VPN connection failed: {}", e);
+                        connect_failed = true;
+                        // connect() may have already spawned the openvpn
+                        // process (e.g. it's stuck on --management-hold
+                        // because wait_for_socket() never reached the point
+                        // of sending "hold release"). Without this, that
+                        // process is orphaned forever: nothing else will
+                        // ever call disconnect() on a connection NM already
+                        // considers failed.
+                        if let Err(cleanup_err) = mgr.disconnect().await {
+                            warn!(
+                                "Error cleaning up OpenVPN process after failed connection: {}",
+                                cleanup_err
+                            );
+                        }
                         let mut state = state_clone.write().await;
                         state.state = NMVpnServiceState::Stopped;
                     }
                 }
             }
 
-            // Store manager back
-            {
+            // Store manager back, unless the connection attempt failed and
+            // was already fully torn down above.
+            if !connect_failed {
                 let mut state = state_clone.write().await;
                 state.vpn_manager = manager;
             }
