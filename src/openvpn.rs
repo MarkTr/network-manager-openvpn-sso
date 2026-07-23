@@ -4,9 +4,10 @@
 //! OpenVPN process management and management interface protocol
 
 use anyhow::{anyhow, Context, Result};
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -74,13 +75,7 @@ pub struct Route {
 /// OpenVPN process manager
 pub struct OpenVpnManager {
     config: ConnectionConfig,
-    /// Loopback TCP port for OpenVPN's management interface, derived
-    /// deterministically from the connection UUID (see
-    /// `management_port_for_uuid`). A Unix socket file was used previously,
-    /// but distro SELinux policy denied both openvpn_t (unlink) and
-    /// NetworkManager_t (getattr) from touching an arbitrary tmp_t path —
-    /// a loopback TCP socket has no filesystem object for SELinux to confine.
-    management_port: u16,
+    socket_path: PathBuf,
     process: Option<Child>,
     event_tx: mpsc::Sender<VpnEvent>,
     /// Cached auth URL from server (received via >INFO:)
@@ -98,11 +93,20 @@ pub struct OpenVpnManager {
 
 impl OpenVpnManager {
     pub fn new(config: ConnectionConfig, event_tx: mpsc::Sender<VpnEvent>) -> Self {
-        let management_port = management_port_for_uuid(&config.uuid);
+        // Under /run/openvpn rather than /tmp: that's openvpn's own existing
+        // runtime directory (created by its package's tmpfiles.d config),
+        // already labeled openvpn_var_run_t by the distro's SELinux openvpn
+        // policy. openvpn_t creating/binding/unlinking a socket there is
+        // already covered by that pre-existing policy with no changes needed
+        // -- a generic /tmp path isn't openvpn's own designated location, and
+        // got denied (unlink) under enforcing. See selinux/nm-openvpn-sso.te
+        // for the additional grant our own domain needs to connect to it.
+        let socket_path =
+            PathBuf::from(format!("/run/openvpn/nm-openvpn-sso-{}.sock", config.uuid));
 
         Self {
             config,
-            management_port,
+            socket_path,
             process: None,
             event_tx,
             pending_auth_url: None,
@@ -114,11 +118,16 @@ impl OpenVpnManager {
 
     /// Start OpenVPN and manage the connection
     pub async fn connect(&mut self) -> Result<()> {
-        // Kill any stale openvpn processes using the same management port
+        // Kill any stale openvpn processes using the same management socket
         self.kill_stale_openvpn_processes().await;
 
+        // Clean up old socket if exists
+        let _ = tokio::fs::remove_file(&self.socket_path).await;
+
         // Build OpenVPN arguments
-        let args = self.config.build_openvpn_args(self.management_port);
+        let args = self
+            .config
+            .build_openvpn_args(self.socket_path.to_str().unwrap());
 
         info!("Starting OpenVPN with args: {:?}", args);
 
@@ -136,27 +145,24 @@ impl OpenVpnManager {
 
         self.process = Some(child);
 
-        // Wait for the management port to be ready
-        self.wait_for_management_port().await?;
+        // Wait for management socket to be ready
+        self.wait_for_socket().await?;
 
         // Connect to management interface and handle events
         self.run_management_loop().await
     }
 
-    /// Kill any stale openvpn processes that reference our management port.
+    /// Kill any stale openvpn processes that reference our management socket path.
     /// This handles the case where a previous connection attempt left orphan processes.
     async fn kill_stale_openvpn_processes(&self) {
-        let marker = format!("--management 127.0.0.1 {}", self.management_port);
+        let socket_str = self.socket_path.to_string_lossy().to_string();
         match Command::new("pkill")
-            .args(["-f", &format!("openvpn.*{}", marker)])
+            .args(["-f", &format!("openvpn.*{}", socket_str)])
             .output()
             .await
         {
             Ok(output) if output.status.success() => {
-                info!(
-                    "Killed stale openvpn processes using port {}",
-                    self.management_port
-                );
+                info!("Killed stale openvpn processes using socket {}", socket_str);
                 // Give processes time to exit
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -164,13 +170,10 @@ impl OpenVpnManager {
         }
     }
 
-    /// Wait for the management port to start accepting connections
-    async fn wait_for_management_port(&mut self) -> Result<()> {
+    /// Wait for the management socket to become available
+    async fn wait_for_socket(&mut self) -> Result<()> {
         for _ in 0..50 {
-            if TcpStream::connect(("127.0.0.1", self.management_port))
-                .await
-                .is_ok()
-            {
+            if self.socket_path.exists() {
                 return Ok(());
             }
             // Check if OpenVPN has already exited (e.g., config error)
@@ -201,7 +204,7 @@ impl OpenVpnManager {
                         error!("OpenVPN stderr: {}", stderr_msg);
                     }
                     return Err(anyhow!(
-                        "OpenVPN exited with status {} before opening its management port. stdout: {} stderr: {}",
+                        "OpenVPN exited with status {} before creating management socket. stdout: {} stderr: {}",
                         status,
                         stdout_msg,
                         stderr_msg
@@ -210,16 +213,14 @@ impl OpenVpnManager {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        Err(anyhow!(
-            "Management port not accepting connections after 5s"
-        ))
+        Err(anyhow!("Management socket not created after 5s"))
     }
 
     /// Main management interface loop
     async fn run_management_loop(&mut self) -> Result<()> {
-        let stream = TcpStream::connect(("127.0.0.1", self.management_port))
+        let stream = UnixStream::connect(&self.socket_path)
             .await
-            .context("Failed to connect to management port")?;
+            .context("Failed to connect to management socket")?;
 
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
@@ -752,7 +753,7 @@ impl OpenVpnManager {
     /// Handle authentication request (fallback for when no SSO URL is available)
     async fn handle_auth(
         &mut self,
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
         auth_url: Option<&str>,
     ) -> Result<()> {
         // First, check for cached credentials
@@ -800,7 +801,7 @@ impl OpenVpnManager {
     ///    completes the VPN authentication by sending PUSH_REPLY
     async fn handle_sso_auth(
         &mut self,
-        _writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        _writer: &mut tokio::net::unix::OwnedWriteHalf,
         auth_url: &str,
     ) -> Result<()> {
         // Prevent duplicate browser launches
@@ -845,7 +846,7 @@ impl OpenVpnManager {
     /// Send credentials to OpenVPN via management interface
     async fn send_credentials(
         &self,
-        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
         token: &str,
     ) -> Result<()> {
         // Send username (often ignored for SSO)
@@ -868,7 +869,7 @@ impl OpenVpnManager {
             info!("Stopping OpenVPN process");
 
             // Try graceful shutdown via management interface first
-            if let Ok(stream) = TcpStream::connect(("127.0.0.1", self.management_port)).await {
+            if let Ok(stream) = UnixStream::connect(&self.socket_path).await {
                 let (_, mut writer) = stream.into_split();
                 let _ = writer.write_all(b"signal SIGTERM\n").await;
 
@@ -892,6 +893,9 @@ impl OpenVpnManager {
 
             self.process = None;
         }
+
+        // Clean up socket
+        let _ = tokio::fs::remove_file(&self.socket_path).await;
 
         // Safety net: if OpenVPN's own shutdown didn't tear down the tunnel
         // interface (e.g. it was SIGKILLed above, orphaning a DCO interface),
@@ -1099,19 +1103,6 @@ fn escape_management_string(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// Deterministically derive a loopback management port from the connection
-/// UUID (FNV-1a hash into the 20000-29999 range), so repeated connection
-/// attempts for the same NM connection reuse the same port — needed for
-/// `kill_stale_openvpn_processes` to find a previous attempt's process.
-fn management_port_for_uuid(uuid: &str) -> u16 {
-    let mut hash: u32 = 0x811c9dc5;
-    for byte in uuid.bytes() {
-        hash ^= byte as u32;
-        hash = hash.wrapping_mul(0x01000193);
-    }
-    20000 + (hash % 10000) as u16
-}
-
 /// Find the network interface currently holding the given IP address, by
 /// parsing `ip -o addr show`. Used to identify the tunnel device since
 /// OpenVPN's `>STATE:...,CONNECTED,...` management message carries the local
@@ -1180,42 +1171,14 @@ impl Drop for OpenVpnManager {
             // Best effort cleanup
             let _ = child.start_kill();
         }
+        // Clean up socket
+        let _ = std::fs::remove_file(&self.socket_path);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn management_port_for_uuid_is_stable_across_calls() {
-        let uuid = "05a6e763-62b1-4c17-ab42-e9ed61a2b3a0";
-        assert_eq!(
-            management_port_for_uuid(uuid),
-            management_port_for_uuid(uuid)
-        );
-    }
-
-    #[test]
-    fn management_port_for_uuid_differs_for_different_uuids() {
-        assert_ne!(
-            management_port_for_uuid("05a6e763-62b1-4c17-ab42-e9ed61a2b3a0"),
-            management_port_for_uuid("11111111-2222-3333-4444-555555555555")
-        );
-    }
-
-    #[test]
-    fn management_port_for_uuid_stays_in_unprivileged_range() {
-        for uuid in [
-            "",
-            "a",
-            "05a6e763-62b1-4c17-ab42-e9ed61a2b3a0",
-            "z".repeat(100).as_str(),
-        ] {
-            let port = management_port_for_uuid(uuid);
-            assert!((20000..30000).contains(&port), "port {} out of range", port);
-        }
-    }
 
     #[test]
     fn parse_interface_by_ip_finds_point_to_point_tun_device() {

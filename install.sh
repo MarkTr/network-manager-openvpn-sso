@@ -106,19 +106,6 @@ else
     warn "KDE Plasma users: install extra-cmake-modules, qt6-base, networkmanager-qt, kio, ki18n, kcoreaddons, plasma-nm and re-run."
 fi
 
-# On SELinux systems, openvpn_t is only allowed to bind TCP ports labeled
-# openvpn_port_t (default: just 1194) — our OpenVPN management interface
-# uses a per-connection TCP port derived from the connection UUID in the
-# 20000-29999 range, which otherwise falls under the generic
-# unreserved_port_t and gets denied. Extend the label to cover it.
-if command -v semanage &> /dev/null && command -v getenforce &> /dev/null \
-    && [[ "$(getenforce)" != "Disabled" ]]; then
-    info "Registering management port range with SELinux..."
-    semanage port -a -t openvpn_port_t -p tcp 20000-29999 2>/dev/null \
-        || semanage port -m -t openvpn_port_t -p tcp 20000-29999 2>/dev/null \
-        || warn "Could not register port range 20000-29999 as openvpn_port_t; connections may fail under SELinux enforcing mode."
-fi
-
 # Reload daemons
 info "Reloading system daemons..."
 dbus-send --system --type=method_call --dest=org.freedesktop.DBus \

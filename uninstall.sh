@@ -25,11 +25,6 @@ info "Stopping service..."
 systemctl stop nm-openvpn-sso.service 2>/dev/null || true
 systemctl disable nm-openvpn-sso.service 2>/dev/null || true
 
-if command -v semanage &> /dev/null; then
-    info "Removing SELinux port registration..."
-    semanage port -d -t openvpn_port_t -p tcp 20000-29999 2>/dev/null || true
-fi
-
 info "Removing files..."
 rm -f "$LIBDIR/nm-openvpn-sso-service"
 rm -f "$LIBDIR/NetworkManager/VPN/nm-openvpn-sso-service.name"
