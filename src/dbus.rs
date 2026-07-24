@@ -50,6 +50,11 @@ pub struct PluginState {
     pub vpn_manager: Option<OpenVpnManager>,
     pub current_config: Option<ConnectionConfig>,
     pub state: NMVpnServiceState,
+    /// Sender to request a graceful shutdown of the currently-running
+    /// manager. `vpn_manager` itself is unavailable for the entire duration
+    /// of an active connection (its `connect()` call doesn't return until
+    /// the connection ends), so this is how `disconnect()` reaches it.
+    pub disconnect_tx: Option<mpsc::Sender<()>>,
 }
 
 impl Default for PluginState {
@@ -58,6 +63,7 @@ impl Default for PluginState {
             vpn_manager: None,
             current_config: None,
             state: NMVpnServiceState::Init,
+            disconnect_tx: None,
         }
     }
 }
@@ -96,6 +102,9 @@ impl VpnPlugin {
 
         // Create and store VPN manager
         let vpn_manager = OpenVpnManager::new(config.clone(), tx);
+        // Grab this before the manager is moved into the spawned task below
+        // — it stays reachable for the whole connection, unlike vpn_manager.
+        let disconnect_tx = vpn_manager.disconnect_sender();
 
         // Update state
         {
@@ -103,6 +112,7 @@ impl VpnPlugin {
             state.current_config = Some(config.clone());
             state.state = NMVpnServiceState::Starting;
             state.vpn_manager = Some(vpn_manager);
+            state.disconnect_tx = Some(disconnect_tx);
         }
 
         // Start connection in background
@@ -245,7 +255,17 @@ impl VpnPlugin {
         let mut state = self.inner_state.write().await;
         state.state = NMVpnServiceState::Stopping;
 
-        if let Some(ref mut manager) = state.vpn_manager {
+        if let Some(tx) = state.disconnect_tx.take() {
+            // The connection is active: vpn_manager itself is unavailable
+            // (held by connect()'s still-running task), so signal it to
+            // shut down instead. It runs the actual cleanup and emits
+            // VpnEvent::State(Stopped) itself once done.
+            if tx.send(()).await.is_err() {
+                warn!("Disconnect signal receiver already gone");
+            }
+        } else if let Some(ref mut manager) = state.vpn_manager {
+            // connect() isn't running (e.g. it already failed and returned),
+            // so the manager is directly available -- disconnect it here.
             if let Err(e) = manager.disconnect().await {
                 warn!("Error during disconnect: {}", e);
             }

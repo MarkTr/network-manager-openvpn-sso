@@ -89,6 +89,14 @@ pub struct OpenVpnManager {
     /// disconnect time to find and force-remove a lingering DCO interface
     /// (see `find_interface_by_ip`/`delete_interface`)
     connected_local_ip: Option<String>,
+    /// Signaled by the D-Bus Disconnect() handler to interrupt
+    /// run_management_loop()'s read loop. That loop holds `&mut self` for
+    /// the entire lifetime of an active connection (connect() doesn't
+    /// return until it ends), so `state.vpn_manager` in dbus.rs is
+    /// unavailable the whole time a connection is up -- this channel is the
+    /// only way to reach a running manager from the outside.
+    disconnect_rx: mpsc::Receiver<()>,
+    disconnect_tx: mpsc::Sender<()>,
 }
 
 impl OpenVpnManager {
@@ -103,6 +111,7 @@ impl OpenVpnManager {
         // for the additional grant our own domain needs to connect to it.
         let socket_path =
             PathBuf::from(format!("/run/openvpn/nm-openvpn-sso-{}.sock", config.uuid));
+        let (disconnect_tx, disconnect_rx) = mpsc::channel(1);
 
         Self {
             config,
@@ -113,7 +122,17 @@ impl OpenVpnManager {
             sso_auth_initiated: false,
             auth_token: None,
             connected_local_ip: None,
+            disconnect_rx,
+            disconnect_tx,
         }
+    }
+
+    /// A clone of the sender used to request a graceful shutdown while this
+    /// manager's `run_management_loop()` is running -- see `disconnect_rx`.
+    /// Callers should grab this right after `new()`, before the manager is
+    /// moved into whatever task calls `connect()`.
+    pub fn disconnect_sender(&self) -> mpsc::Sender<()> {
+        self.disconnect_tx.clone()
     }
 
     /// Start OpenVPN and manage the connection
@@ -251,11 +270,23 @@ impl OpenVpnManager {
 
         loop {
             line.clear();
-            let n = reader.read_line(&mut line).await?;
-
-            if n == 0 {
-                warn!("Management connection closed");
-                break;
+            // Race the next management-interface line against an external
+            // disconnect request: this loop holds &mut self for as long as
+            // the connection is active, so a signal on disconnect_rx is the
+            // only way the D-Bus Disconnect() handler can reach a running
+            // manager (see the field doc comment on disconnect_rx).
+            tokio::select! {
+                result = reader.read_line(&mut line) => {
+                    let n = result?;
+                    if n == 0 {
+                        warn!("Management connection closed");
+                        break;
+                    }
+                }
+                _ = self.disconnect_rx.recv() => {
+                    info!("Disconnect requested while connected");
+                    break;
+                }
             }
 
             let line = line.trim();
@@ -745,6 +776,14 @@ impl OpenVpnManager {
                     .await
                     .ok();
             }
+        }
+
+        // Whether the loop ended because the connection was lost on its own
+        // or because Disconnect() signaled it above, make sure the process
+        // is actually gone and any lingering tunnel interface is cleaned up
+        // -- disconnect() is idempotent (safe even if already stopped).
+        if let Err(e) = self.disconnect().await {
+            warn!("Error during post-loop cleanup: {}", e);
         }
 
         Ok(())
