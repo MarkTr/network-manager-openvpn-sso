@@ -12,6 +12,8 @@ use axum::{
 };
 use notify_rust::Notification;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -305,159 +307,51 @@ fn try_open_browser(url: &str) -> bool {
             }
         };
 
-        let xdg_runtime = format!("/run/user/{}", uid);
-
         // Get user's environment from their processes
         let user_env = get_user_graphical_env(&user, uid);
         info!("User graphical env: {:?}", user_env);
 
-        // Method 1 (preferred): Use systemd-run --user to run in the user's session scope.
-        //
-        // systemd-run --user only gives the transient unit whatever's already in the
-        // user's systemd --user manager's own environment — which does not reliably
-        // include WAYLAND_DISPLAY/DISPLAY/DBUS_SESSION_BUS_ADDRESS unless the desktop
-        // session explicitly imported them. Explicitly pass the same env vars Method 2
-        // discovers via /proc/<pid>/environ, via --setenv, so this has the same chance
-        // of working as the runuser fallback below.
-        //
-        // --no-block previously made systemd-run return as soon as the job was *queued*,
-        // not once xdg-open actually ran — its exit status only reflected "systemd
-        // accepted the job", not "the browser opened". That made this method silently
-        // "succeed" even when xdg-open failed inside the user's session, masking the
-        // real failure and preventing the working fallback methods below from ever
-        // being tried. Use --wait instead so the exit status is xdg-open's own, bounded
-        // by an outer `timeout` in case a browser wrapper never detaches.
-        //
-        // xdg-open on GNOME resolves to `gio open`, which just fires an async D-Bus
-        // request and returns immediately — the actual browser window appears slightly
-        // *after* xdg-open exits. With --collect, systemd-run tears down the transient
-        // unit's cgroup the instant its direct child exits, which can kill that in-flight
-        // activation before the window appears. Sleep briefly after xdg-open returns so
-        // the unit survives long enough for the async launch to actually complete
-        // (confirmed empirically: adding a delay after xdg-open is what made this work).
-        {
-            let mut cmd = std::process::Command::new("timeout");
-            cmd.arg("12").arg("systemd-run").args([
-                "--user",
-                &format!("--machine={}@", user),
-                "--collect",
-                "--wait",
-                "--quiet",
-            ]);
-            for (key, value) in &user_env {
-                cmd.arg(format!("--setenv={}={}", key, value));
+        // Re-exec ourselves as the target user (CommandExt::uid/gid drops
+        // privileges in the child before exec, so this is still our own
+        // already-permitted binary — no new SELinux exec/domain-transition
+        // surface) to ask their session's xdg-desktop-portal to open the
+        // URL. Previous approaches (systemd-run --user, runuser -> xdg-open
+        // -> firefox) each required this root service to itself execute
+        // xauth, scan desktop-file databases, and exec the browser directly
+        // — under SELinux enforcement, NetworkManager_t (this service's
+        // inherited domain, having none of its own) is denied every one of
+        // those. The portal call sidesteps all of it: xdg-desktop-portal,
+        // already running natively in the user's own session, does the
+        // actual browser launch itself.
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Could not determine our own executable path: {}", e);
+                return try_fallback_browser(url);
             }
-            cmd.args(["--", "sh", "-c", "xdg-open \"$1\"; sleep 2", "sh", url]);
+        };
 
-            info!(
-                "Running: timeout 12 systemd-run --user --machine={}@ --wait xdg-open {} (+2s grace period)",
-                user, url
-            );
-            match cmd.output() {
-                Ok(output) if output.status.success() => {
-                    info!("Browser opened via systemd-run --user (using default browser)");
-                    return true;
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!(
-                        "systemd-run --user failed (status {:?}): {}",
-                        output.status,
-                        stderr.trim()
-                    );
-                }
-                Err(e) => {
-                    warn!("systemd-run failed to execute: {}", e);
-                }
-            }
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("open-url").arg(url).uid(uid).gid(uid);
+        for (key, value) in &user_env {
+            cmd.env(key, value);
         }
+        cmd.env("XDG_RUNTIME_DIR", format!("/run/user/{}", uid));
 
-        // Method 2: Try xdg-open with user's environment via runuser
-        {
-            let mut cmd = std::process::Command::new("runuser");
-            cmd.args(["-u", &user, "--"]);
-
-            // Ensure PATH includes standard locations
-            cmd.env(
-                "PATH",
-                "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-            );
-
-            for (key, value) in &user_env {
-                cmd.env(key, value);
+        info!(
+            "Re-executing self as uid {} to call the OpenURI portal for {}",
+            uid, url
+        );
+        match cmd.status() {
+            Ok(status) if status.success() => {
+                info!("Browser opened via xdg-desktop-portal OpenURI");
+                return true;
             }
-            cmd.env("XDG_RUNTIME_DIR", &xdg_runtime);
-            cmd.arg("xdg-open").arg(url);
-
-            info!("Running: runuser -u {} -- xdg-open {}", user, url);
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    // Wait a moment to see if xdg-open immediately fails
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    match child.try_wait() {
-                        Ok(Some(status)) if !status.success() => {
-                            warn!("xdg-open exited with non-zero status: {:?}", status);
-                            // Continue to try direct browsers
-                        }
-                        Ok(Some(_)) => {
-                            info!("Browser opened via runuser xdg-open (using default browser)");
-                            return true;
-                        }
-                        Ok(None) => {
-                            // Still running, likely working
-                            info!("Browser opened via runuser xdg-open (using default browser)");
-                            return true;
-                        }
-                        Err(e) => {
-                            warn!("Failed to check xdg-open status: {}", e);
-                            return true; // Assume success
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("runuser xdg-open failed to spawn: {}", e);
-                }
+            Ok(status) => {
+                warn!("open-url helper exited with status {:?}", status);
             }
-        }
-
-        // Method 3: Try browsers directly (fallback)
-        for browser in &[
-            "vivaldi-stable",
-            "vivaldi",
-            "firefox",
-            "chromium",
-            "google-chrome-stable",
-            "brave",
-        ] {
-            let mut cmd = std::process::Command::new("runuser");
-            cmd.args(["-u", &user, "--"]);
-
-            // Ensure PATH includes standard locations
-            cmd.env(
-                "PATH",
-                "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
-            );
-
-            // Set essential environment variables
-            for (key, value) in &user_env {
-                cmd.env(key, value);
-            }
-            cmd.env("XDG_RUNTIME_DIR", &xdg_runtime);
-
-            info!("Trying browser: runuser -u {} -- {} {}", user, browser, url);
-            cmd.arg(browser).arg(url);
-
-            match cmd.spawn() {
-                Ok(_) => {
-                    info!("Browser opened via runuser -u {} {}", user, browser);
-                    return true;
-                }
-                Err(e) => {
-                    // Only log if the browser exists but failed for another reason
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!("Failed to launch {} via runuser: {}", browser, e);
-                    }
-                }
+            Err(e) => {
+                warn!("Failed to re-exec self for open-url: {}", e);
             }
         }
     } else {
@@ -465,6 +359,33 @@ fn try_open_browser(url: &str) -> bool {
     }
 
     try_fallback_browser(url)
+}
+
+/// Ask the session's xdg-desktop-portal to open a URL in the user's default
+/// browser. Invoked from a copy of this same binary re-executed as the
+/// target user (see `try_open_browser`) — by the time this runs, the
+/// process is already that user, so `zbus`'s standard session-bus discovery
+/// (DBUS_SESSION_BUS_ADDRESS, falling back to $XDG_RUNTIME_DIR/bus) finds
+/// the right bus without any special handling here.
+pub async fn open_url_via_portal(url: &str) -> Result<()> {
+    let connection = zbus::connection::Builder::session()?
+        .build()
+        .await
+        .context("Failed to connect to session D-Bus")?;
+
+    let options: HashMap<&str, zbus::zvariant::Value> = HashMap::new();
+    connection
+        .call_method(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.OpenURI"),
+            "OpenURI",
+            &("", url, options),
+        )
+        .await
+        .context("OpenURI portal call failed")?;
+
+    Ok(())
 }
 
 /// Try fallback browser methods (unlikely to work from root)
